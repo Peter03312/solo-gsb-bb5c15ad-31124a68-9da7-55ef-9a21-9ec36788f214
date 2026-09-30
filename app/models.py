@@ -55,7 +55,11 @@ class RecordVersion(Base):
 
 
 class Snapshot(Base):
-    """发布产生的不可变快照：只保存脱敏后的正文，后续修订不影响它。"""
+    """发布产生的不可变快照：只保存脱敏后的正文，后续修订不影响它。
+
+    撤回是永久状态：一旦 withdrawn_at 写入，公开读取一律拒绝，
+    但快照行（含历史脱敏正文）仍留存，同记录其他版本不受影响。
+    """
 
     __tablename__ = "snapshots"
     __table_args__ = (
@@ -71,6 +75,12 @@ class Snapshot(Base):
     published_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), nullable=False
     )
+    # 撤回时刻：NULL 表示未撤回；一旦设置不再改变（重复撤回保留首次结果）
+    withdrawn_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    # 撤回原因：仅维护侧可见，公开侧绝不透露
+    withdraw_reason: Mapped[str | None] = mapped_column(Text, nullable=True)
 
 
 class ReadToken(Base):

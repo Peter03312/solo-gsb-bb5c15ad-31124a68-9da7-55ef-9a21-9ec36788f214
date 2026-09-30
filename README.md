@@ -9,6 +9,8 @@
 
 签发快照读取令牌时可**可选**地设置正整数**读取次数上限**（`max_reads`）：直接发布在请求时确定，受控发布在提交申请时冻结、批准签发后生效。公开读取沿用既有脱敏正文响应，每次凭有效令牌**成功读取**消耗一次；无效、撤销、到期、令牌与快照不匹配或已达上限的请求不消耗次数。
 
+已发布的快照可凭服务密钥**永久撤回**（提交快照标识与撤回原因）：撤回提交后新开始的公开读取无论持哪枚令牌一律 `403 snapshot unavailable` 且不消耗次数；撤回只作用于该快照，同记录其他版本继续可读，历史脱敏正文与已批准申请仍留存；该版本再次直接发布、提交受控申请或批准待审申请均返回 `409`，待审申请仍可驳回。
+
 - 技术栈：Python 3.12 · FastAPI · SQLAlchemy 2 · PostgreSQL 16
 - 服务地址：`http://localhost:8000`（交互式文档：`http://localhost:8000/docs`）
 
@@ -67,7 +69,8 @@ Compose 会启动 PostgreSQL 与 API 两个容器，自动完成依赖安装与�
 | `GET` | `/records/{record_id}/publish-requests` | 任一已认证操作者 | 列出某记录的全部申请（不含原文） |
 | `GET` | `/tokens/{token}` | 服务密钥 | 查询令牌状态：上限 `max_reads`、已用 `reads_used`、剩余 `remaining_reads`（不含原文） |
 | `POST` | `/tokens/{token}/revoke` | 服务密钥 | 撤销读取令牌（含受控发布签发的令牌） |
-| `GET` | `/records/{record_id}` | 服务密钥 | 查看当前版本、受控标记与快照列表 |
+| `POST` | `/snapshots/{snapshot_id}/withdraw` | 服务密钥 | 永久撤回快照（提交撤回原因；幂等，重复撤回返回首次结果） |
+| `GET` | `/records/{record_id}` | 服务密钥 | 查看当前版本、受控标记与快照列表（含各快照撤回时间、原因与状态） |
 | `GET` | `/public/snapshots/{snapshot_id}?token=...` | 无（凭令牌） | 公开读取脱敏正文 |
 | `GET` | `/healthz` | 无 | 健康检查 |
 
@@ -88,6 +91,48 @@ Compose 会启动 PostgreSQL 与 API 两个容器，自动完成依赖安装与�
 - **撤销/到期优先**：即使尚有剩余次数，撤销或到期后读取一律 `403`，不能因尚有次数而放行。
 - **并发安全**：次数判定与递增由公开读取接口内的**同一条条件 `UPDATE`** 原子完成（`reads_used < max_reads` 命中行锁串行化），并发读取的成功次数绝不超过上限；撤销是独立的原子 `UPDATE`，提交后优先生效。
 - **维护侧查询**：`GET /tokens/{token}`（服务密钥）返回 `max_reads` / `reads_used` / `remaining_reads`（不限次时后两者中的上限与剩余为 `null`）及 `active` 等元数据；该接口**不返回快照原文或脱敏正文**，未知令牌 `404`，缺密钥 `401`。
+
+### 快照撤回（withdraw）
+
+机构发现某个已发布版本不应继续公开时，可凭服务密钥提交**快照标识与撤回原因**，将该快照**永久撤回**：
+
+- **提交与返回**：`POST /snapshots/{snapshot_id}/withdraw`，请求体 `{"reason": "..."}`（必填，1–2000 字）。返回快照标识、**首次撤回时间**与状态（`withdrawn`）；**重复撤回返回首次结果**（时间与原因均以首次为准，响应保持一致）。
+- **作用范围**：撤回只作用于该快照——同记录其他版本继续可读；历史脱敏正文与已批准申请**仍留存**（快照行不删除，申请记录不变）。
+- **公开读取**：撤回提交后**新开始**的公开读取，无论持有该快照哪枚令牌，均沿用现有 `403 snapshot unavailable`，**不消耗读取次数**，也**不透露撤回原因**；并发撤回与读取同样遵守此界限（以撤回事务提交时刻为界）。
+- **再发布限制**：该版本再次直接发布、提交受控申请或批准既有待审申请均返回 `409`；待审申请**仍可驳回**。
+- **错误约定**：未知快照 `404`；缺失或错误服务密钥 `401`；缺少撤回原因 `422`。
+- **维护侧可见**：`GET /records/{record_id}` 的快照列表中，每个快照带 `status`（`published`/`withdrawn`）、`withdrawn_at` 与 `withdraw_reason`（未撤回为 `null`）；撤回原因仅维护侧可见。
+
+```bash
+# 撤回快照（服务密钥；返回首次撤回时间与状态）
+curl -sS -X POST http://localhost:8000/snapshots/<SID>/withdraw \
+  -H "X-Service-Key: dev-service-key-change-me" \
+  -H "Content-Type: application/json" \
+  -d '{"reason": "发现未脱敏的身份证号，依法撤回"}'
+# => {"snapshot_id":"<SID>","record_id":"<RID>","version":2,
+#     "status":"withdrawn","reason":"发现未脱敏的身份证号，依法撤回",
+#     "withdrawn_at":"2026-09-30T08:00:00.000000+00:00"}
+
+# 重复撤回返回首次结果（reason 与 withdrawn_at 不变）
+curl -sS -X POST http://localhost:8000/snapshots/<SID>/withdraw \
+  -H "X-Service-Key: dev-service-key-change-me" \
+  -H "Content-Type: application/json" -d '{"reason": "另一个原因"}'
+
+# 撤回后公开读取：任何令牌一律 403，且不消耗读取次数
+curl -sS "http://localhost:8000/public/snapshots/<SID>?token=<TOKEN>"
+# => 403 {"detail":"snapshot unavailable"}
+
+# 维护侧记录状态可见撤回时间、原因与状态
+curl -sS http://localhost:8000/records/<RID> -H "X-Service-Key: dev-service-key-change-me"
+# => {"snapshots":[{"snapshot_id":"<SID>","status":"withdrawn",
+#      "withdrawn_at":"...","withdraw_reason":"发现未脱敏的身份证号，依法撤回", ...}], ...}
+```
+
+完整撤回流程演示（含 401/404/409/422、任意令牌 403 且不计数、重复撤回幂等、其他版本不受影响、受控流程冲突与驳回）：
+
+```bash
+./examples/demo_withdraw.sh   # 可用 BASE_URL / SERVICE_KEY / ALICE_PW / BOB_PW 覆盖
+```
 
 ### 调用示例
 
@@ -234,15 +279,17 @@ curl -sS http://localhost:8000/records/<RID>/publish-requests -u alice:alice-pw
   - 发布用 `INSERT ... ON CONFLICT DO NOTHING` 保证同一版本只有一份快照，快照与令牌同事务提交，不存在部分发布；
   - 受控复核用 `SELECT ... FOR UPDATE` 锁定申请行串行化并发批准/驳回，配合终态检查保证同一申请只有一个终态；
   - 公开读取的**有效性判定与次数消耗合并为同一条条件 `UPDATE ... WHERE 未撤销 AND 未到期 AND (不限次 OR reads_used < max_reads)`**，命中行即 `reads_used = reads_used + 1`：行锁串行化并发读取，成功次数绝不超过上限；撤销/到期不命中因而不消耗次数，且优先于“尚有剩余次数”；
-  - 撤销是单条原子 `UPDATE`，提交后新开始的读取即被拒绝。
-- **不泄露原文**：公开接口只返回快照中的脱敏正文；令牌无效/撤销/到期/次数用尽/与快照不匹配统一返回模糊的 `403 snapshot unavailable`；维护侧令牌查询与受控申请查询只返回元数据与计数，错误信息不含原文内容。
+  - 撤销是单条原子 `UPDATE`，提交后新开始的读取即被拒绝；
+  - 撤回是条件 `UPDATE ... WHERE withdrawn_at IS NULL`：并发撤回只有一个写入撤回时间与原因，其余回滚后读取首次结果，保证重复/并发撤回返回同一份首次结果。
+- **快照撤回**：撤回是快照上的永久标记（`withdrawn_at`/`withdraw_reason`），快照行与历史脱敏正文保留；公开读取在消耗次数之前先检查撤回标记，已撤回快照一律 `403 snapshot unavailable` 且不计数；已撤回版本在直接发布、提交受控申请、批准待审申请三处入口统一 `409`，待审申请仍可驳回；撤回原因只出现在维护侧响应中。
+- **不泄露原文**：公开接口只返回快照中的脱敏正文；令牌无效/撤销/到期/次数用尽/与快照不匹配/快照已撤回统一返回模糊的 `403 snapshot unavailable`；维护侧令牌查询与受控申请查询只返回元数据与计数，错误信息不含原文内容。
 - **令牌**：`secrets.token_urlsafe(32)` 随机生成；支持 `expires_in_seconds` 或 `expires_at`（二选一）设置到期时间，并支持可选正整数 `max_reads` 读取次数上限；到期、撤销或次数用尽后读取一律拒绝。直接发布与受控批准共用同一套令牌规则、计数、查询与撤销接口。
 - **受控发布**：
   - 申请行保存**冻结副本** `frozen_text`/`frozen_intervals`，复核批准基于副本做脱敏，历史版本行即使变化也不影响待审内容；
   - 批准/驳回先 `SELECT ... FOR UPDATE` 锁定申请行，把并发复核串行化：先提交者写入终态，后提交者看到非 `pending` 收到 `409`，配合 `status` 检查约束，保证同一申请只有一个终态；
   - 批准时**快照、新令牌、申请终态在同一事务提交**，任一异常整体回滚，不会留下无主或可读令牌；驳回不产生快照/令牌；
   - 个人凭据（HTTP Basic）与机构服务密钥（`X-Service-Key`）分离，角色为 `operator`/`reviewer`，申请人与复核人身份按用户名强制不同；
-  - 既有数据库升级时启动会幂等补列 `records.controlled`（旧记录默认非受控）、`read_tokens.max_reads`/`reads_used`（既有令牌 `max_reads` 为空即继续不限次、已用为 0）与 `publish_requests.token_max_reads`，新表随 `create_all` 幂等创建。
+  - 既有数据库升级时启动会幂等补列 `records.controlled`（旧记录默认非受控）、`read_tokens.max_reads`/`reads_used`（既有令牌 `max_reads` 为空即继续不限次、已用为 0）、`publish_requests.token_max_reads` 与 `snapshots.withdrawn_at`/`withdraw_reason`（既有快照保持未撤回），新表随 `create_all` 幂等创建。
 
 ## 本地开发
 
@@ -267,8 +314,8 @@ python3 -m unittest tests.test_integration_api -v
 
 ```
 app/
-  main.py       # 路由与事务逻辑（受控发布申请-复核、令牌读取次数计数与查询）
-  models.py     # records / record_versions / snapshots / read_tokens(含 max_reads/reads_used) / publish_requests
+  main.py       # 路由与事务逻辑（受控发布申请-复核、令牌读取次数计数与查询、快照撤回）
+  models.py     # records / record_versions / snapshots(含撤回标记) / read_tokens(含 max_reads/reads_used) / publish_requests
   redaction.py  # 区间校验、合并、替换（纯函数）
   schemas.py    # 请求/响应模型（含 max_reads 与令牌状态响应）
   security.py   # 服务密钥与操作者个人凭据（Basic）鉴权、角色依赖
@@ -277,6 +324,7 @@ app/
 examples/
   demo.sh             # 直接发布端到端调用示例
   demo_controlled.sh  # 受控发布（申请-复核）端到端调用示例
+  demo_withdraw.sh    # 快照撤回端到端调用示例
 tests/
   test_redaction.py       # 脱敏逻辑单元测试
   test_config.py          # 操作者凭据配置校验单元测试

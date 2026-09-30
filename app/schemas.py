@@ -61,6 +61,26 @@ class SnapshotInfo(BaseModel):
     version: int
     status: str
     published_at: datetime
+    # 撤回信息（仅维护侧可见）；未撤回时为 null
+    withdrawn_at: datetime | None = None
+    withdraw_reason: str | None = None
+
+
+class SnapshotWithdrawRequest(BaseModel):
+    """撤回快照：必须给出撤回原因（仅维护侧记录与展示，公开侧不透露）。"""
+
+    reason: str = Field(min_length=1, max_length=2000)
+
+
+class SnapshotWithdrawResponse(BaseModel):
+    """撤回结果：重复撤回返回首次撤回的时间与原因，响应保持一致。"""
+
+    snapshot_id: UUID
+    record_id: UUID
+    version: int
+    status: str
+    reason: str
+    withdrawn_at: datetime
 
 
 class RecordStatusResponse(BaseModel):
