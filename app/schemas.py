@@ -46,6 +46,19 @@ class ReviewRejectRequest(BaseModel):
     reason: str | None = Field(default=None, max_length=2000)
 
 
+class SnapshotWithdrawRequest(BaseModel):
+    # 撤回原因：首次撤回必填（非空白），重复撤回时沿用首次结果、忽略本次内容
+    reason: str | None = Field(default=None, max_length=2000)
+
+
+class SnapshotWithdrawResponse(BaseModel):
+    """撤回结果：重复撤回也返回首次撤回的时间与状态。"""
+
+    snapshot_id: UUID
+    withdrawn_at: datetime
+    status: str
+
+
 class RecordResponse(BaseModel):
     record_id: UUID
     version: int
@@ -61,6 +74,9 @@ class SnapshotInfo(BaseModel):
     version: int
     status: str
     published_at: datetime
+    # 维护侧状态：撤回时间与原因；未撤回时均为 null（原因不向公开侧透露）
+    withdrawn_at: datetime | None = None
+    withdraw_reason: str | None = None
 
 
 class RecordStatusResponse(BaseModel):

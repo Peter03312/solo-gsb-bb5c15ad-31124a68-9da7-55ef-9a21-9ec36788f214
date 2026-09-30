@@ -71,6 +71,13 @@ class Snapshot(Base):
     published_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), nullable=False
     )
+    # 永久撤回：withdrawn_at 为空表示仍公开；非空即永久不可公开读取。
+    # 撤回只作用于本快照：同记录其他版本、历史脱敏正文与已批准申请均继续留存。
+    withdrawn_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    # 撤回原因仅维护侧可见，公开侧的模糊 403 绝不透露它
+    withdraw_reason: Mapped[str | None] = mapped_column(Text, nullable=True)
 
 
 class ReadToken(Base):

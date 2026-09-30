@@ -841,5 +841,271 @@ class ControlledPublishIntegrationTests(unittest.TestCase):
         self.assertIsNone(q["remaining_reads"])
 
 
+    # ---- 快照永久撤回 ----
+
+    def _withdraw(self, snapshot_id, reason="误发，撤回", expected=200):
+        body = {} if reason is None else {"reason": reason}
+        r = self.client.post(
+            f"/snapshots/{snapshot_id}/withdraw", headers=SERVICE_HEADERS, json=body
+        )
+        self.assertEqual(r.status_code, expected, r.text)
+        return r
+
+    def test_withdraw_requires_service_key_and_unknown_is_404(self):
+        import uuid
+
+        # 缺失/错误服务密钥沿用 401（且在未知性判断之前整次拒绝）
+        r = self.client.post(
+            f"/snapshots/{uuid.uuid4()}/withdraw", json={"reason": "x"}
+        )
+        self.assertEqual(r.status_code, 401)
+        r = self.client.post(
+            f"/snapshots/{uuid.uuid4()}/withdraw",
+            headers={"X-Service-Key": "wrong-key"},
+            json={"reason": "x"},
+        )
+        self.assertEqual(r.status_code, 401)
+        # 密钥正确但快照未知 -> 404
+        r = self._withdraw(uuid.uuid4(), expected=404)
+
+    def test_withdraw_first_time_requires_reason_422(self):
+        pub = self._direct_publish()
+        sid = pub["snapshot_id"]
+        # 缺 reason / 空白 reason -> 422，且不产生撤回
+        for body in ({}, {"reason": ""}, {"reason": "   "}):
+            r = self.client.post(
+                f"/snapshots/{sid}/withdraw", headers=SERVICE_HEADERS, json=body
+            )
+            self.assertEqual(r.status_code, 422, r.text)
+        r = self.client.get(f"/records/{self.record_id}", headers=SERVICE_HEADERS)
+        self.assertEqual(r.json()["snapshots"][0]["status"], "published")
+
+    def test_withdrawn_snapshot_reads_403_for_any_token_without_consuming(self):
+        # 两支令牌：一支带次数上限，一支不限次
+        pub1 = self._direct_publish(body_extra={"max_reads": 3})
+        sid, tok1 = pub1["snapshot_id"], pub1["token"]
+        tok2 = self._read_token_for_same_snapshot_via_republish(sid)
+        # 撤回前各成功读一次
+        self.assertEqual(
+            self.client.get(f"/public/snapshots/{sid}?token={tok1}").status_code, 200
+        )
+        self.assertEqual(
+            self.client.get(f"/public/snapshots/{sid}?token={tok2}").status_code, 200
+        )
+        r = self._withdraw(sid, reason="发现不应公开的内容")
+        self.assertEqual(r.status_code, 200)
+        body = r.json()
+        self.assertEqual(body["snapshot_id"], sid)
+        self.assertEqual(body["status"], "withdrawn")
+        self.assertIsNotNone(body["withdrawn_at"])
+        self.assertNotIn("reason", body)  # 撤回响应不向操作回执以外扩散原因
+        # 无论持有哪枚令牌（甚至无效令牌），公开读取统一 403 snapshot unavailable
+        for tok in (tok1, tok2, "not-a-token"):
+            r = self.client.get(f"/public/snapshots/{sid}?token={tok}")
+            self.assertEqual(r.status_code, 403)
+            self.assertEqual(r.json()["detail"], "snapshot unavailable")
+            self.assertNotIn("撤回", r.text)  # 公开侧不透露撤回原因
+        # 撤回后的读取不消耗次数
+        q1 = self.client.get(f"/tokens/{tok1}", headers=SERVICE_HEADERS).json()
+        q2 = self.client.get(f"/tokens/{tok2}", headers=SERVICE_HEADERS).json()
+        self.assertEqual(q1["reads_used"], 1)
+        self.assertEqual(q1["remaining_reads"], 2)
+        self.assertEqual(q2["reads_used"], 1)
+
+    def test_repeat_withdraw_returns_first_result_and_keeps_first_reason(self):
+        pub = self._direct_publish(body_extra={"max_reads": 5})
+        sid = pub["snapshot_id"]
+        first = self._withdraw(sid, reason="首次撤回原因").json()
+        first_at = first["withdrawn_at"]
+        # 重复撤回（即便原因不同或为空）返回首次时间与状态
+        for body in ({"reason": "另一个原因"}, {}):
+            r = self.client.post(
+                f"/snapshots/{sid}/withdraw", headers=SERVICE_HEADERS, json=body
+            )
+            self.assertEqual(r.status_code, 200, r.text)
+            again = r.json()
+            self.assertEqual(again["status"], "withdrawn")
+            self.assertEqual(again["withdrawn_at"], first_at)
+        # 维护侧记录保留首次撤回时间与原因
+        r = self.client.get(f"/records/{self.record_id}", headers=SERVICE_HEADERS)
+        info = r.json()["snapshots"][0]
+        self.assertEqual(info["status"], "withdrawn")
+        self.assertEqual(info["withdrawn_at"], first_at)
+        self.assertEqual(info["withdraw_reason"], "首次撤回原因")
+
+    def test_withdraw_is_scoped_to_single_snapshot(self):
+        # 版本 1 与版本 2 都发布；撤回版本 1 不影响版本 2
+        pub1 = self._direct_publish(version=1)
+        sid1, tok1 = pub1["snapshot_id"], pub1["token"]
+        r = self.client.put(
+            f"/records/{self.record_id}",
+            headers=SERVICE_HEADERS,
+            json={"base_version": 1, "text": TEXT_V2, "intervals": [{"start": 9, "end": 15}]},
+        )
+        self.assertEqual(r.status_code, 200, r.text)
+        pub2 = self._direct_publish(version=2)
+        sid2, tok2 = pub2["snapshot_id"], pub2["token"]
+        self._withdraw(sid1)
+        # 版本 1 不可读；版本 2 继续可读
+        self.assertEqual(
+            self.client.get(f"/public/snapshots/{sid1}?token={tok1}").status_code, 403
+        )
+        r = self.client.get(f"/public/snapshots/{sid2}?token={tok2}")
+        self.assertEqual(r.status_code, 200, r.text)
+        self.assertNotIn(TEXT_V1, r.text)
+        # 维护侧两个快照状态并存；撤回的历史脱敏正文仍留存可见于记录状态
+        r = self.client.get(f"/records/{self.record_id}", headers=SERVICE_HEADERS)
+        snapshots = r.json()["snapshots"]
+        statuses = {s["version"]: s["status"] for s in snapshots}
+        self.assertEqual(statuses, {1: "withdrawn", 2: "published"})
+        self.assertEqual(snapshots[0]["withdraw_reason"], "误发，撤回")
+
+    def test_direct_publish_of_withdrawn_version_conflicts(self):
+        pub = self._direct_publish()
+        sid = pub["snapshot_id"]
+        self._withdraw(sid)
+        # 再次直接发布同一版本 -> 409，且不签发新令牌
+        r = self.client.post(
+            f"/records/{self.record_id}/publish",
+            headers=SERVICE_HEADERS,
+            json={"version": 1, "max_reads": 9},
+        )
+        self.assertEqual(r.status_code, 409, r.text)
+        # 修订出新版本后仍可正常发布（撤回只作用于该快照）
+        r = self.client.put(
+            f"/records/{self.record_id}",
+            headers=SERVICE_HEADERS,
+            json={"base_version": 1, "text": TEXT_V2, "intervals": [{"start": 9, "end": 15}]},
+        )
+        self.assertEqual(r.status_code, 200, r.text)
+        r = self.client.post(
+            f"/records/{self.record_id}/publish",
+            headers=SERVICE_HEADERS,
+            json={"version": 2},
+        )
+        self.assertEqual(r.status_code, 201, r.text)
+        r = self.client.get(
+            f"/public/snapshots/{r.json()['snapshot_id']}?token={r.json()['token']}"
+        )
+        self.assertEqual(r.status_code, 200)
+
+    def test_controlled_submit_for_withdrawn_version_conflicts(self):
+        # 先发布版本 1（非受控直接发布）再撤回，随后把记录转为受控
+        pub = self._direct_publish()
+        self._withdraw(pub["snapshot_id"])
+        self._mark_controlled()
+        r = self._submit(expected=409)
+        self.assertNotIn(TEXT_V1, r.text)
+
+    def test_pending_request_can_be_rejected_but_approval_conflicts_after_withdraw(self):
+        self._mark_controlled()
+        self._submit(version=1, expires={"max_reads": 2})
+        request_id = self._latest_request_id()
+        # 期间该版本经另一申请批准产生快照并被撤回（模拟版本曾公开后撤回）
+        other = self._submit()
+        other_id = self._latest_request_id_from_list()
+        r = self.client.post(f"/publish-requests/{other_id}/approve", auth=BASIC_BOB)
+        self.assertEqual(r.status_code, 200, r.text)
+        sid = r.json()["snapshot_id"]
+        self._withdraw(sid, reason="复核后发现问题")
+        # 撤回不改动待审申请；批准命中已撤回快照 -> 409，申请仍可驳回
+        r = self.client.get(f"/publish-requests/{request_id}", auth=BASIC_ALICE)
+        self.assertEqual(r.json()["status"], "pending")
+        r = self.client.post(f"/publish-requests/{request_id}/approve", auth=BASIC_BOB)
+        self.assertEqual(r.status_code, 409, r.text)
+        r = self.client.post(
+            f"/publish-requests/{request_id}/reject",
+            auth=BASIC_BOB,
+            json={"reason": "版本已撤回，不予批准"},
+        )
+        self.assertEqual(r.status_code, 200, r.text)
+        self.assertEqual(r.json()["status"], "rejected")
+        # 已批准申请记录仍留存，并指向撤回快照
+        r = self.client.get(f"/publish-requests/{other_id}", auth=BASIC_ALICE)
+        self.assertEqual(r.json()["status"], "approved")
+        self.assertEqual(r.json()["snapshot_id"], sid)
+        # 撤回后公开读取仍 403
+        self.assertEqual(
+            self.client.get(f"/public/snapshots/{sid}?token=x").status_code, 403
+        )
+
+    def _latest_request_id_from_list(self):
+        r = self.client.get(
+            f"/records/{self.record_id}/publish-requests", auth=BASIC_ALICE
+        )
+        self.assertEqual(r.status_code, 200, r.text)
+        return r.json()["requests"][-1]["request_id"]
+
+    def test_concurrent_withdraw_and_reads_respect_boundary(self):
+        pub = self._direct_publish(body_extra={"max_reads": 50})
+        sid, tok = pub["snapshot_id"], pub["token"]
+        results: list[int] = []
+        barrier = threading.Barrier(9)
+
+        def withdraw():
+            barrier.wait()
+            client = TestClient(app_main.app)
+            r = client.post(
+                f"/snapshots/{sid}/withdraw",
+                headers=SERVICE_HEADERS,
+                json={"reason": "并发撤回"},
+            )
+            results.append(0 if r.status_code == 200 else r.status_code)
+
+        def read_once():
+            barrier.wait()
+            client = TestClient(app_main.app)
+            # 略作退让，争取让撤回先提交；无论先后，撤回提交后的读取必须 403
+            code = client.get(f"/public/snapshots/{sid}?token={tok}").status_code
+            results.append(code)
+
+        threads = [threading.Thread(target=withdraw)]
+        threads += [threading.Thread(target=read_once) for _ in range(8)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        self.assertIn(0, results)  # 撤回成功
+        concurrent_reads = [c for c in results if c != 0]
+        # 撤回提交后开始的读取一律 403；在撤回提交前已获行锁的读取至多 8 个 200
+        self.assertTrue(all(c in (200, 403) for c in concurrent_reads), results)
+        # 撤回完成后的新读取稳定 403
+        for _ in range(5):
+            self.assertEqual(
+                self.client.get(f"/public/snapshots/{sid}?token={tok}").status_code, 403
+            )
+        q = self.client.get(f"/tokens/{tok}", headers=SERVICE_HEADERS).json()
+        # 消耗次数恰为并发阶段的 200 数，撤回后的 403 未消耗
+        self.assertEqual(q["reads_used"], concurrent_reads.count(200))
+
+    def test_existing_db_gets_snapshot_withdrawal_columns(self):
+        from sqlalchemy import inspect, text
+
+        from app.db import SessionLocal, engine
+        from app.models import Snapshot as SnapshotModel
+
+        pub = self._direct_publish()
+        sid = pub["snapshot_id"]
+        with engine.begin() as conn:
+            conn.execute(text("ALTER TABLE snapshots DROP COLUMN withdraw_reason"))
+            conn.execute(text("ALTER TABLE snapshots DROP COLUMN withdrawn_at"))
+        app_main._init_db_with_retry()
+        columns = {c["name"] for c in inspect(engine).get_columns("snapshots")}
+        self.assertIn("withdrawn_at", columns)
+        self.assertIn("withdraw_reason", columns)
+        # 既有快照迁移后默认未撤回，继续可读
+        r = self.client.get(
+            f"/public/snapshots/{sid}?token={pub['token']}"
+        )
+        self.assertEqual(r.status_code, 200, r.text)
+        # 补列后撤回功能正常
+        r = self._withdraw(sid)
+        self.assertEqual(r.json()["status"], "withdrawn")
+        with SessionLocal() as session:
+            row = session.get(SnapshotModel, sid)
+            self.assertIsNotNone(row.withdrawn_at)
+            self.assertEqual(row.withdraw_reason, "误发，撤回")
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -5,9 +5,11 @@
 支持两种发布方式：
 
 - **直接发布**（既有能力）：维护人员凭服务密钥直接发布指定版本；
-- **受控发布**（本轮新增）：机构先把记录标记为受控，操作者用**各自的凭据与身份**提交指定历史版本的发布申请，由**另一名具复核资格者**批准或驳回（申请人不得复核）；批准时在同一事务生成不可变快照与新读取令牌。
+- **受控发布**（申请-复核）：机构先把记录标记为受控，操作者用**各自的凭据与身份**提交指定历史版本的发布申请，由**另一名具复核资格者**批准或驳回（申请人不得复核）；批准时在同一事务生成不可变快照与新读取令牌。
 
-签发快照读取令牌时可**可选**地设置正整数**读取次数上限**（`max_reads`）：直接发布在请求时确定，受控发布在提交申请时冻结、批准签发后生效。公开读取沿用既有脱敏正文响应，每次凭有效令牌**成功读取**消耗一次；无效、撤销、到期、令牌与快照不匹配或已达上限的请求不消耗次数。
+已发布版本若不应继续公开，机构可凭服务密钥将对应**快照永久撤回**：撤回只作用于该快照，同记录其他版本继续可读；撤回后无论持有该快照的哪枚令牌，新开始的公开读取一律沿用模糊 `403 snapshot unavailable` 且不消耗读取次数；该版本再次直接发布、提交受控申请或批准撤回前已在审的申请均返回 `409`，待审申请仍可驳回。
+
+签发快照读取令牌时可**可选**地设置正整数**读取次数上限**（`max_reads`）：直接发布在请求时确定，受控发布在提交申请时冻结、批准签发后生效。公开读取沿用既有脱敏正文响应，每次凭有效令牌**成功读取**消耗一次；无效、撤销、到期、快照已撤回、令牌与快照不匹配或已达上限的请求不消耗次数。
 
 - 技术栈：Python 3.12 · FastAPI · SQLAlchemy 2 · PostgreSQL 16
 - 服务地址：`http://localhost:8000`（交互式文档：`http://localhost:8000/docs`）
@@ -67,7 +69,8 @@ Compose 会启动 PostgreSQL 与 API 两个容器，自动完成依赖安装与�
 | `GET` | `/records/{record_id}/publish-requests` | 任一已认证操作者 | 列出某记录的全部申请（不含原文） |
 | `GET` | `/tokens/{token}` | 服务密钥 | 查询令牌状态：上限 `max_reads`、已用 `reads_used`、剩余 `remaining_reads`（不含原文） |
 | `POST` | `/tokens/{token}/revoke` | 服务密钥 | 撤销读取令牌（含受控发布签发的令牌） |
-| `GET` | `/records/{record_id}` | 服务密钥 | 查看当前版本、受控标记与快照列表 |
+| `POST` | `/snapshots/{snapshot_id}/withdraw` | 服务密钥 | **永久撤回快照**（首次需带 `reason`）；重复撤回返回首次撤回时间与状态 |
+| `GET` | `/records/{record_id}` | 服务密钥 | 查看当前版本、受控标记与快照列表（含撤回时间、原因与状态） |
 | `GET` | `/public/snapshots/{snapshot_id}?token=...` | 无（凭令牌） | 公开读取脱敏正文 |
 | `GET` | `/healthz` | 无 | 健康检查 |
 
@@ -88,6 +91,23 @@ Compose 会启动 PostgreSQL 与 API 两个容器，自动完成依赖安装与�
 - **撤销/到期优先**：即使尚有剩余次数，撤销或到期后读取一律 `403`，不能因尚有次数而放行。
 - **并发安全**：次数判定与递增由公开读取接口内的**同一条条件 `UPDATE`** 原子完成（`reads_used < max_reads` 命中行锁串行化），并发读取的成功次数绝不超过上限；撤销是独立的原子 `UPDATE`，提交后优先生效。
 - **维护侧查询**：`GET /tokens/{token}`（服务密钥）返回 `max_reads` / `reads_used` / `remaining_reads`（不限次时后两者中的上限与剩余为 `null`）及 `active` 等元数据；该接口**不返回快照原文或脱敏正文**，未知令牌 `404`，缺密钥 `401`。
+
+### 快照永久撤回
+
+机构发现某个已发布版本不应继续公开时，凭服务密钥调用
+`POST /snapshots/{snapshot_id}/withdraw`，请求体携带撤回原因 `{"reason": "..."}`：
+
+- **响应**：`{"snapshot_id", "withdrawn_at", "status": "withdrawn"}`，其中 `withdrawn_at` 为**首次**撤回时间。
+- **幂等**：重复撤回（即使原因不同或不带原因）返回**首次**撤回时间与状态，首次原因保留不变；并发撤回由条件 `UPDATE` 串行化，恰好一个首次结果。
+- **作用域**：撤回只作用于该快照。同记录其他版本的快照与令牌继续可读；快照中的**历史脱敏正文、已批准的发布申请记录均继续留存**（维护侧可查）。
+- **公开侧效果**：撤回提交后才开始的公开读取，无论持有该快照的**哪枚令牌**（或无效令牌），一律沿用既有模糊拒绝 `403 snapshot unavailable`；这些请求**不消耗**任何令牌的读取次数，公开响应也**不透露撤回原因**。
+- **并发界限**：公开读取先对快照行加锁再判定，读取与撤回由数据库行锁串行化——撤回提交前已在读的请求按既有规则处理，撤回提交后开始的读取必定 403 且不计数。
+- **发布冲突**：该版本
+  - 再次**直接发布** → `409`（不会复用撤回快照签出新令牌）；
+  - **提交受控申请** → `409`；
+  - 撤回前已存在的**待审申请**，批准时 → `409`（不签发令牌），但**仍可驳回**；已批准申请记录继续留存。
+- **状态码**：未知快照 `404`；缺失或错误服务密钥沿用 `401`；首次撤回缺少非空白 `reason` → `422`。
+- **维护侧可见**：`GET /records/{record_id}` 的每个快照条目含 `status`（`published` / `withdrawn`）、`withdrawn_at`、`withdraw_reason`。
 
 ### 调用示例
 
@@ -129,12 +149,32 @@ curl -sS "http://localhost:8000/public/snapshots/<SID>?token=<TOKEN>"
 # 5. 撤销令牌（撤销完成后，即使尚有剩余次数，新开始的读取一律 403）
 curl -sS -X POST http://localhost:8000/tokens/<TOKEN>/revoke \
   -H "X-Service-Key: dev-service-key-change-me"
+
+# 6. 永久撤回快照（首次需带原因；重复撤回返回首次 withdrawn_at 与 status）
+curl -sS -X POST http://localhost:8000/snapshots/<SID>/withdraw \
+  -H "X-Service-Key: dev-service-key-change-me" -H "Content-Type: application/json" \
+  -d '{"reason":"发现该版本不应继续公开"}'
+# => {"snapshot_id":"<SID>","withdrawn_at":"2026-09-30T12:00:00Z","status":"withdrawn"}
+# 撤回后：公开读取（任意令牌）一律 403 snapshot unavailable 且不消耗次数；
+#        该版本再次直接发布/提交受控申请/批准在审申请均 409，待审申请仍可驳回。
+curl -sS "http://localhost:8000/public/snapshots/<SID>?token=<TOKEN>"
+# => 403 {"detail":"snapshot unavailable"}
+# 维护侧记录状态可见撤回时间与原因（公开侧不透露原因）
+curl -sS http://localhost:8000/records/<RID> -H "X-Service-Key: dev-service-key-change-me"
+# => {"snapshots":[{"version":2,"status":"withdrawn",
+#                   "withdrawn_at":"...","withdraw_reason":"发现该版本不应继续公开", ...}, ...]}
 ```
 
 完整端到端演示（含 401/409/422、快照不可变、`max_reads` 次数上限与独立计数、维护侧计数查询、撤销与到期）：
 
 ```bash
 ./examples/demo.sh        # 依赖 curl 与 jq；可用 BASE_URL / SERVICE_KEY 覆盖默认配置
+```
+
+完整快照撤回演示（含 401/404/422、重复撤回幂等、撤回后任意令牌 403 不计数、同记录其他版本可读、三类发布冲突 409、在审申请仍可驳回）：
+
+```bash
+./examples/demo_withdraw.sh   # 可用 BASE_URL / SERVICE_KEY / ALICE_PW / BOB_PW 覆盖
 ```
 
 ## 受控发布（申请-复核）
@@ -224,7 +264,7 @@ curl -sS http://localhost:8000/records/<RID>/publish-requests -u alice:alice-pw
 | 已认证但缺少所需角色（operator/reviewer） | `403` |
 | 申请人复核自己的申请 | `403` |
 | 未知记录 / 版本 / 申请 | `404` |
-| 受控记录直接发布、非受控记录提交申请、对已终结申请再操作、令牌到期时间非法 | `409` / `422` |
+| 受控记录直接发布、非受控记录提交申请、对已终结申请再操作、提交/批准命中已撤回版本、令牌到期时间非法 | `409` / `422` |
 
 ## 设计要点
 
@@ -235,14 +275,20 @@ curl -sS http://localhost:8000/records/<RID>/publish-requests -u alice:alice-pw
   - 受控复核用 `SELECT ... FOR UPDATE` 锁定申请行串行化并发批准/驳回，配合终态检查保证同一申请只有一个终态；
   - 公开读取的**有效性判定与次数消耗合并为同一条条件 `UPDATE ... WHERE 未撤销 AND 未到期 AND (不限次 OR reads_used < max_reads)`**，命中行即 `reads_used = reads_used + 1`：行锁串行化并发读取，成功次数绝不超过上限；撤销/到期不命中因而不消耗次数，且优先于“尚有剩余次数”；
   - 撤销是单条原子 `UPDATE`，提交后新开始的读取即被拒绝。
-- **不泄露原文**：公开接口只返回快照中的脱敏正文；令牌无效/撤销/到期/次数用尽/与快照不匹配统一返回模糊的 `403 snapshot unavailable`；维护侧令牌查询与受控申请查询只返回元数据与计数，错误信息不含原文内容。
+- **快照永久撤回**：
+  - `snapshots` 增加 `withdrawn_at` / `withdraw_reason`：`withdrawn_at` 为空即仍公开，非空为撤回终态；撤回原因仅维护侧返回，公开侧永不透露；
+  - 撤回是一条条件 `UPDATE ... WHERE withdrawn_at IS NULL`，并发撤回只有一个首次结果，落选方读回首次时间与状态，重复撤回完全幂等；
+  - 公开读取先 `SELECT ... FOR UPDATE` 锁定快照行再判定，撤回与读取按快照行锁串行化：撤回提交后开始的读取在计数 `UPDATE` 之前就收到模糊 403，**不返回正文也不消耗次数**；
+  - 直接发布/受控批准在写令牌前以 `FOR UPDATE` 取快照并检查撤回状态，提交受控申请在写申请前检查；已撤回版本的重新公开一律 `409`，但撤回前已在审的申请仍可驳回；
+  - 撤回不删除任何数据：历史脱敏正文、同记录其他版本快照、已批准申请记录全部留存，仅公开读取被关闭。
+- **不泄露原文**：公开接口只返回快照中的脱敏正文；令牌无效/撤销/到期/次数用尽/快照已撤回/与快照不匹配统一返回模糊的 `403 snapshot unavailable`；维护侧令牌查询与受控申请查询只返回元数据与计数，错误信息不含原文内容。
 - **令牌**：`secrets.token_urlsafe(32)` 随机生成；支持 `expires_in_seconds` 或 `expires_at`（二选一）设置到期时间，并支持可选正整数 `max_reads` 读取次数上限；到期、撤销或次数用尽后读取一律拒绝。直接发布与受控批准共用同一套令牌规则、计数、查询与撤销接口。
 - **受控发布**：
   - 申请行保存**冻结副本** `frozen_text`/`frozen_intervals`，复核批准基于副本做脱敏，历史版本行即使变化也不影响待审内容；
   - 批准/驳回先 `SELECT ... FOR UPDATE` 锁定申请行，把并发复核串行化：先提交者写入终态，后提交者看到非 `pending` 收到 `409`，配合 `status` 检查约束，保证同一申请只有一个终态；
   - 批准时**快照、新令牌、申请终态在同一事务提交**，任一异常整体回滚，不会留下无主或可读令牌；驳回不产生快照/令牌；
   - 个人凭据（HTTP Basic）与机构服务密钥（`X-Service-Key`）分离，角色为 `operator`/`reviewer`，申请人与复核人身份按用户名强制不同；
-  - 既有数据库升级时启动会幂等补列 `records.controlled`（旧记录默认非受控）、`read_tokens.max_reads`/`reads_used`（既有令牌 `max_reads` 为空即继续不限次、已用为 0）与 `publish_requests.token_max_reads`，新表随 `create_all` 幂等创建。
+  - 既有数据库升级时启动会幂等补列 `records.controlled`（旧记录默认非受控）、`read_tokens.max_reads`/`reads_used`（既有令牌 `max_reads` 为空即继续不限次、已用为 0）、`publish_requests.token_max_reads` 与 `snapshots.withdrawn_at`/`withdraw_reason`（既有快照默认未撤回、继续可读），新表随 `create_all` 幂等创建。
 
 ## 本地开发
 
@@ -267,16 +313,17 @@ python3 -m unittest tests.test_integration_api -v
 
 ```
 app/
-  main.py       # 路由与事务逻辑（受控发布申请-复核、令牌读取次数计数与查询）
-  models.py     # records / record_versions / snapshots / read_tokens(含 max_reads/reads_used) / publish_requests
+  main.py       # 路由与事务逻辑（受控发布申请-复核、令牌读取次数计数与查询、快照永久撤回）
+  models.py     # records / record_versions / snapshots(含撤回字段) / read_tokens(含 max_reads/reads_used) / publish_requests
   redaction.py  # 区间校验、合并、替换（纯函数）
-  schemas.py    # 请求/响应模型（含 max_reads 与令牌状态响应）
+  schemas.py    # 请求/响应模型（含撤回请求/响应、max_reads 与令牌状态响应）
   security.py   # 服务密钥与操作者个人凭据（Basic）鉴权、角色依赖
   config.py     # 环境变量配置（含 REVIEW_CREDENTIALS 校验）
   db.py         # 引擎与会话
 examples/
   demo.sh             # 直接发布端到端调用示例
   demo_controlled.sh  # 受控发布（申请-复核）端到端调用示例
+  demo_withdraw.sh    # 快照永久撤回端到端调用示例
 tests/
   test_redaction.py       # 脱敏逻辑单元测试
   test_config.py          # 操作者凭据配置校验单元测试

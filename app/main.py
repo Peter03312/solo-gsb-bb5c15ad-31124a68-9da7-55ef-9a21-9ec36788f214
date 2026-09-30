@@ -41,11 +41,19 @@ from .schemas import (
     ReviewRejectRequest,
     RevokeResponse,
     SnapshotInfo,
+    SnapshotWithdrawRequest,
+    SnapshotWithdrawResponse,
     TokenStatusResponse,
 )
 from .security import Operator, require_operator, require_role, require_service_key
 
 SNAPSHOT_STATUS = "published"
+SNAPSHOT_WITHDRAWN_STATUS = "withdrawn"
+
+
+def _snapshot_status(snapshot: Snapshot) -> str:
+    """快照维护状态：撤回为终态，撤回前沿用 published。"""
+    return SNAPSHOT_WITHDRAWN_STATUS if snapshot.withdrawn_at is not None else SNAPSHOT_STATUS
 
 
 def _init_db_with_retry() -> None:
@@ -71,6 +79,19 @@ def _apply_lightweight_migrations() -> None:
         statements.append(
             "ALTER TABLE records ADD COLUMN controlled BOOLEAN NOT NULL DEFAULT false"
         )
+    if "snapshots" in inspector.get_table_names():
+        snapshot_columns = {
+            column["name"] for column in inspector.get_columns("snapshots")
+        }
+        if "withdrawn_at" not in snapshot_columns:
+            # 既有快照默认未撤回（NULL），继续可读
+            statements.append(
+                "ALTER TABLE snapshots ADD COLUMN withdrawn_at TIMESTAMP"
+            )
+        if "withdraw_reason" not in snapshot_columns:
+            statements.append(
+                "ALTER TABLE snapshots ADD COLUMN withdraw_reason TEXT"
+            )
     if "read_tokens" in inspector.get_table_names():
         token_columns = {
             column["name"] for column in inspector.get_columns("read_tokens")
@@ -116,8 +137,8 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="Redacted Records API",
-    version="1.2.0",
-    summary="机构公开脱敏记录服务（受控发布申请-复核 + 令牌读取次数上限）",
+    version="1.3.0",
+    summary="机构公开脱敏记录服务（受控发布申请-复核 + 读取次数上限 + 快照永久撤回）",
     lifespan=lifespan,
 )
 
@@ -310,11 +331,19 @@ def publish_record(record_id: UUID, payload: PublishPayload, db: Session = Depen
         .values(record_id=record_id, version=payload.version, redacted_text=redacted)
         .on_conflict_do_nothing(constraint="uq_snapshots_record_version")
     )
+    # 锁定快照行后再判定撤回状态：与撤回操作串行化，
+    # 已被永久撤回的版本不能通过再次直接发布重新公开。
     snapshot = db.execute(
-        select(Snapshot).where(
-            Snapshot.record_id == record_id, Snapshot.version == payload.version
-        )
+        select(Snapshot)
+        .where(Snapshot.record_id == record_id, Snapshot.version == payload.version)
+        .with_for_update()
     ).scalar_one()
+    if snapshot.withdrawn_at is not None:
+        db.rollback()
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="snapshot has been withdrawn and cannot be published again",
+        )
     token = ReadToken(
         token=secrets.token_urlsafe(32),
         snapshot_id=snapshot.id,
@@ -359,6 +388,17 @@ def submit_publish_request(
     if version is None:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND, detail="record version not found"
+        )
+    existing_snapshot = db.execute(
+        select(Snapshot).where(
+            Snapshot.record_id == record_id, Snapshot.version == payload.version
+        )
+    ).scalar_one_or_none()
+    if existing_snapshot is not None and existing_snapshot.withdrawn_at is not None:
+        # 已永久撤回的版本不能再提交受控申请（冻结内容也不会重新公开）
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="snapshot of this version has been withdrawn",
         )
     _validate_expiry_policy(payload.expires_in_seconds, payload.expires_at)
     expires_at = payload.expires_at
@@ -448,11 +488,20 @@ def approve_publish_request(
         .on_conflict_do_nothing(constraint="uq_snapshots_record_version")
     )
     snapshot = db.execute(
-        select(Snapshot).where(
+        select(Snapshot)
+        .where(
             Snapshot.record_id == request.record_id,
             Snapshot.version == request.version,
         )
+        .with_for_update()
     ).scalar_one()
+    if snapshot.withdrawn_at is not None:
+        # 申请等待期间该版本快照被永久撤回：不能批准重新公开（仍可驳回本申请）
+        db.rollback()
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="snapshot of this version has been withdrawn",
+        )
     token = ReadToken(
         token=secrets.token_urlsafe(32),
         snapshot_id=snapshot.id,
@@ -622,6 +671,54 @@ def get_token_status(token: str, db: Session = Depends(get_db)):
     )
 
 
+@app.post(
+    "/snapshots/{snapshot_id}/withdraw",
+    response_model=SnapshotWithdrawResponse,
+    dependencies=[Depends(require_service_key)],
+)
+def withdraw_snapshot(
+    snapshot_id: UUID,
+    payload: SnapshotWithdrawRequest = Body(default_factory=SnapshotWithdrawRequest),
+    db: Session = Depends(get_db),
+):
+    """将快照永久撤回：记录首次撤回时间与原因，重复撤回返回首次结果。
+
+    - 未知快照 -> 404；缺失/错误服务密钥 -> 401；
+    - 首次撤回必须提供非空白原因 -> 422；
+    - 条件 UPDATE 只命中未撤回行：并发撤回恰好一个成功，
+      落选方随后读回首次撤回时间与状态，结果幂等。
+    """
+    snapshot = db.get(Snapshot, snapshot_id)
+    if snapshot is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail="snapshot not found"
+        )
+    if snapshot.withdrawn_at is None and not (payload.reason and payload.reason.strip()):
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="reason is required when withdrawing a snapshot",
+        )
+    # 原子条件更新：只有未撤回行能命中，首次撤回时间由此固定，永不被覆盖。
+    withdrawn_at = db.execute(
+        update(Snapshot)
+        .where(Snapshot.id == snapshot_id, Snapshot.withdrawn_at.is_(None))
+        .values(withdrawn_at=func.now(), withdraw_reason=payload.reason)
+        .returning(Snapshot.withdrawn_at)
+    ).scalar_one_or_none()
+    if withdrawn_at is None:
+        # 已被（并发的）首次撤回终结：回滚本次更新，读回首次结果
+        db.rollback()
+        snapshot = db.get(Snapshot, snapshot_id)
+        withdrawn_at = snapshot.withdrawn_at
+    else:
+        db.commit()
+    return SnapshotWithdrawResponse(
+        snapshot_id=snapshot_id,
+        withdrawn_at=withdrawn_at,
+        status=SNAPSHOT_WITHDRAWN_STATUS,
+    )
+
+
 @app.get(
     "/records/{record_id}",
     response_model=RecordStatusResponse,
@@ -647,8 +744,10 @@ def get_record(record_id: UUID, db: Session = Depends(get_db)):
             SnapshotInfo(
                 snapshot_id=s.id,
                 version=s.version,
-                status=SNAPSHOT_STATUS,
+                status=_snapshot_status(s),
                 published_at=s.published_at,
+                withdrawn_at=s.withdrawn_at,
+                withdraw_reason=s.withdraw_reason,
             )
             for s in snapshots
         ],
@@ -663,6 +762,10 @@ def read_snapshot(
 ):
     """公开读取：凭有效令牌返回脱敏正文。
 
+    先对快照行加锁再判定有效性，使读取与永久撤回由数据库行锁串行化：
+    撤回提交后才开始的读取在此看到 withdrawn_at 非空，直接返回模糊 403，
+    既不返回正文也不执行计数 UPDATE（不消耗任何令牌的读取次数）。
+
     有效性判定与次数消耗由同一条条件 UPDATE 原子完成：
     - 令牌不存在、与快照不匹配、已撤销、已到期或已达上限 -> rowcount=0，
       统一返回模糊的 403，且这些请求不消耗次数；
@@ -670,9 +773,13 @@ def read_snapshot(
     - 次数判断（reads_used < max_reads）与递增在同一行更新内完成，
       并发读取由数据库行锁串行化，成功次数绝不超过上限。
     """
-    snapshot = db.get(Snapshot, snapshot_id)
-    if snapshot is None:
-        # 不区分“快照不存在 / 令牌无效 / 已撤销 / 已过期 / 次数用尽”
+    snapshot = db.execute(
+        select(Snapshot).where(Snapshot.id == snapshot_id).with_for_update()
+    ).scalar_one_or_none()
+    if snapshot is None or snapshot.withdrawn_at is not None:
+        # 不区分“快照不存在 / 已撤回 / 令牌无效 / 已撤销 / 已过期 / 次数用尽”，
+        # 已撤回时直接拒绝，不触碰读取计数。
+        db.rollback()
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN, detail="snapshot unavailable"
         )
